@@ -1,4 +1,4 @@
-module eth2-merkle-server
+module github.com/protolambda/eth2-merkle-server
 
 go 1.15
 

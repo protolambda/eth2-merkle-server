@@ -3,8 +3,8 @@ package chain
 import (
 	"context"
 	"errors"
-	"eth2-merkle-server/chain/db/states"
 	"fmt"
+	"github.com/protolambda/eth2-merkle-server/chain/db/states"
 	"github.com/protolambda/zrnt/eth2/beacon"
 	"github.com/protolambda/ztyp/tree"
 	"sync"
