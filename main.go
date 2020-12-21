@@ -26,8 +26,8 @@ import (
 )
 
 func main() {
-	beaconAddr := flag.String("beacon-addr", "http://localhost:4000", "Beacon API addr to use")
-	srvAddr := flag.String("srv-addr", "http://localhost:5000", "Addr to serve app on")
+	beaconAddr := flag.String("beacon-addr", "http://localhost:4000/", "Beacon API addr to use")
+	srvAddr := flag.String("srv-addr", "localhost:5000", "Addr to serve app on")
 	blocksPath := flag.String("blocks-path", "blocks", "blocks storage path")
 	anchorPath := flag.String("anchor-path", "genesis.ssz", "state anchor path")
 
@@ -62,7 +62,7 @@ func runApp(ctx context.Context, spec *beacon.Spec,
 	state, err := loadStateFile(spec, anchorPath)
 	if err != nil {
 		fmt.Println("no local state, getting it from API instead now")
-		state, err := loadStateApi(ctx, beaconAddr, spec)
+		state, err = loadStateApi(ctx, beaconAddr, spec)
 		check(err)
 		fmt.Println("got state from API, persisting it for later use")
 		// save the state for later
@@ -80,12 +80,12 @@ func runApp(ctx context.Context, spec *beacon.Spec,
 
 	blockDB := blocks.NewFileDB(spec, blocksPath)
 
-	server := NewServer(beaconAddr, spec, srvAddr, blockDB, stateDB, ch)
+	server := NewServer(srvAddr, spec, beaconAddr, blockDB, stateDB, ch)
 	server.Start(ctx)
 }
 
 func writeStateFile(state *beacon.BeaconStateView, path string) error {
-	f, err := os.Open(path)
+	f, err := os.Create(path)
 	defer f.Close()
 	if err != nil {
 		return err
@@ -116,7 +116,7 @@ func loadStateApi(ctx context.Context, apiAddr string, spec *beacon.Spec) (*beac
 		},
 	}
 	var state beacon.BeaconState
-	if exists, err := debugapi.State(ctx, cli, eth2api.StateIdSlot(0), &state); err != nil {
+	if exists, err := debugapi.BeaconState(ctx, cli, eth2api.StateIdSlot(0), &state); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "failed to query genesis state: %v\n", err)
 		os.Exit(1)
 	} else if !exists {
@@ -136,13 +136,19 @@ type Server struct {
 	apiCli  *eth2api.HttpClient
 }
 
-func NewServer(addr string, spec *beacon.Spec, apiAddr string, blockDB blocks.DB, stateDB states.DB, chain chain.FullChain) *Server {
-	return &Server{addr, spec, blockDB, stateDB, chain, &eth2api.HttpClient{
-		Addr: apiAddr,
-		Cli: &http.Client{
-			Timeout: time.Second * 10,
-		},
-	}}
+func NewServer(srvAddr string, spec *beacon.Spec, apiAddr string, blockDB blocks.DB, stateDB states.DB, chain chain.FullChain) *Server {
+	return &Server{
+		addr:    srvAddr,
+		spec:    spec,
+		blockDB: blockDB,
+		stateDB: stateDB,
+		chain:   chain,
+		apiCli: &eth2api.HttpClient{
+			Addr: apiAddr,
+			Cli: &http.Client{
+				Timeout: time.Second * 10,
+			},
+		}}
 }
 
 func (s *Server) Start(ctx context.Context) {
@@ -159,15 +165,14 @@ func (s *Server) Start(ctx context.Context) {
 			log.Fatal("client hub server err: ", err)
 		}
 	}()
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Print("Server shutdown failed: ", err)
-		}
-	}()
 	if err := s.processLoop(ctx); err != nil {
 		log.Println("processLoop failed: ", err)
+	}
+	fmt.Println("done processing, stopping server")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Print("Server shutdown failed: ", err)
 	}
 }
 
@@ -176,12 +181,15 @@ func (s *Server) processLoop(ctx context.Context) error {
 	defer slotTicker.Stop()
 
 	for {
+		fmt.Println("loop iter")
 		select {
 		case <-slotTicker.C:
 			if err := s.syncApi(ctx, 2000); err != nil { // TODO
-				fmt.Printf("ERROR: failed to run sync: %v", err)
+				fmt.Printf("ERROR: failed to run sync: %v\n", err)
 			}
+			fmt.Println("tick")
 		case <-ctx.Done():
+			fmt.Printf("process loop stopped: %v\n", ctx.Err())
 			return nil
 		}
 	}
@@ -201,24 +209,26 @@ func (s *Server) syncApi(ctx context.Context, maxSlot beacon.Slot) error {
 	if err != nil {
 		return fmt.Errorf("could not get head: %v", err)
 	}
-	headSlot, headRoot := head.Slot(), head.BlockRoot()
-	for i := headSlot + 1; i < syncStatus.HeadSlot && i < maxSlot; i++ {
-		var blockHeader beacon.SignedBeaconBlockHeader
-		if exists, err := beaconapi.BlockHeader(ctx, s.apiCli, eth2api.BlockIdSlot(i), &blockHeader); err != nil {
+	for i := head.Slot() + 1; i < syncStatus.HeadSlot && i < maxSlot; i++ {
+		var blockHeaderInfo eth2api.BeaconBlockHeaderAndInfo
+		if exists, err := beaconapi.BlockHeader(ctx, s.apiCli, eth2api.BlockIdSlot(i), &blockHeaderInfo); err != nil {
 			return fmt.Errorf("failed to get block at slot %d from API", i)
 		} else if !exists {
 			// gap slot
 			continue
 		}
-		// reorg detection
-		if blockHeader.Message.ParentRoot != headRoot {
-			// TODO reorg: track back unknown parent roots
-		}
+		blockHeader := &blockHeaderInfo.Header
 		root := blockHeader.Message.HashTreeRoot(tree.GetHashFn())
-		if blockHeader.Message.Slot != i {
-			return fmt.Errorf("block %s at query slot %d was actually slot %d",
+		if blockHeader.Message.Slot > i {
+			return fmt.Errorf("block %s at query slot %d was higher than expected slot %d",
 				root.String(), i, blockHeader.Message.Slot)
+		} else if blockHeader.Message.Slot < i {
+			// gap slot, getting old block again. (API problem in lighthouse)
+			continue
 		}
+		// TODO: reorg detection
+
+		fmt.Printf("processing block %s at slot %d\n", root.String(), i)
 		if _, err := s.chain.ByBlockRoot(root); err == nil {
 			// we already know the block, skip it
 			fmt.Printf("skipping block, chain already has block %s at slot %d\n", root.String(), i)
@@ -249,7 +259,7 @@ func (s *Server) syncApi(ctx context.Context, maxSlot beacon.Slot) error {
 
 		// Add block to the chain (and do block processing)
 		if err := s.chain.AddBlock(ctx, &block); err != nil {
-			return fmt.Errorf("failed to add block %s (slot %d) to chain", root.String(), i)
+			return fmt.Errorf("failed to add block %s (slot %d) to chain: %v", root.String(), i, err)
 		}
 		// Add the attestations of the block to the chain (we should have committee info etc. ready
 		// since we just processed the block that includes the attestations)

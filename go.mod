@@ -11,4 +11,5 @@ require (
 replace (
 	github.com/protolambda/zrnt => ../zrnt
 	github.com/protolambda/ztyp => ../ztyp
+	github.com/protolambda/eth2api => ../eth2api
 )

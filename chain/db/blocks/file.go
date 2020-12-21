@@ -27,6 +27,7 @@ func (db *FileDB) rootToPath(root beacon.Root) string {
 	return path.Join(db.basePath, "0x"+hex.EncodeToString(root[:])+".ssz")
 }
 
+// does not overwrite if the file already exists
 func (db *FileDB) Store(ctx context.Context, block *BlockWithRoot) (exists bool, err error) {
 	outPath := db.rootToPath(block.Root)
 	f, err := os.OpenFile(outPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0755)
@@ -63,6 +64,9 @@ func (db *FileDB) Get(ctx context.Context, root beacon.Root, dest *beacon.Signed
 	f, err := os.Open(outPath)
 	defer f.Close()
 	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	info, err := f.Stat()
@@ -92,6 +96,9 @@ func (db *FileDB) Export(root beacon.Root, w io.Writer) (exists bool, err error)
 	f, err := os.Open(outPath)
 	defer f.Close()
 	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	_, err = io.Copy(w, f)
